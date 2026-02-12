@@ -30,6 +30,101 @@ Analyzed undocumented serial communication to decode:
 
 **Devices supported:** 3 PEMF therapy device types with automatic detection.
 
+#### Sniffed Protocol Analysis
+
+Captured thousands of serial operations via USB sniffing, then built parsers to reconstruct the protocol:
+
+```python
+def parse_protocol_file(filepath):
+    """
+    Parse sniffed protocol output into structured operations.
+    Handles consolidated operations, timing data, and multiple encodings.
+    """
+    operations = []
+    current_stage = None
+    
+    # Handle different file encodings from various capture tools
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        with open(filepath, 'r', encoding='utf-16') as f:
+            lines = f.readlines()
+    
+    for line in lines:
+        # Parse operation lines: [XXXX] OPERATION details [+XXms]
+        op_match = re.match(r'\[(\d+)(?:-(\d+))?\]\s+(.+)', line)
+        if op_match:
+            op_start = int(op_match.group(1))
+            op_end = int(op_match.group(2)) if op_match.group(2) else op_start
+            op_content = op_match.group(3)
+            
+            # Extract timing data
+            delay_match = re.search(r'\[(\+)?(\d+)ms\]', op_content)
+            delay_ms = int(delay_match.group(2)) if delay_match else 0
+            
+            # Route to type-specific parsers...
+```
+
+#### Context-Aware Missing Byte Recovery
+
+The USB sniffer occasionally drops fast back-to-back writes. We detect and fix these using protocol context:
+
+```python
+# Command context tracking for payload-aware fixes
+COMMAND_PAYLOADS = {
+    'I': 54,    # Treatment name: exactly 54 chars
+    'R': 4,     # Run command: 4 char payload ("00hh")  
+    'P': 4,     # Program command: 4 char payload
+    'W': None,  # Write data: variable until 'V' terminator
+    'i': None,  # Flash write: variable until DEL (0x7F)
+}
+
+def fix_missing_bytes(operations):
+    """
+    Reconstruct dropped bytes using protocol context.
+    
+    When sniffer drops a WRITE, the subsequent READ echo won't match.
+    We detect mismatches and reconstruct the missing cycle.
+    """
+    # Track command state
+    current_command = None
+    payload_remaining = 0
+    
+    for i, op in enumerate(operations):
+        if op['action'] == 'WRITE':
+            byte_val = op.get('value', 0)
+            
+            # Check if inside a data payload first
+            if payload_remaining > 0:
+                payload_remaining -= 1
+                continue
+                
+            # Detect new command
+            if chr(byte_val) in COMMAND_PAYLOADS:
+                current_command = chr(byte_val)
+                # Payload starts after echo...
+```
+
+#### Timing-Based Anomaly Detection
+
+Protocol timing reveals sniffer drops — a 31-32ms delay where 16ms is expected indicates a missing byte cycle:
+
+```python
+# FIX: Mismatched echo with anomalous delay
+if (op['action'] == 'READ' and 
+        op.get('delay_before_ms') in [31, 32] and  # Double normal delay
+        i >= 2):
+    
+    # Find the WRITE this should be echoing
+    write_op = find_previous_write(operations, i)
+    
+    if write_op and write_op.get('value') != op.get('value'):
+        # Echo doesn't match — sniffer dropped a full cycle
+        # Reconstruct: READ(correct) → PURGE → WRITE(dropped) → SET_TIMEOUTS → READ
+        insert_missing_cycle(fixed_ops, write_op, op)
+```
+
 ### 2. Device Abstraction Layer
 
 Unified interface regardless of underlying hardware:
