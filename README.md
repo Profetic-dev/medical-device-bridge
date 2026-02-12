@@ -1,6 +1,6 @@
 # Medical Device Protocol Bridge
 
-A reverse-engineered integration layer for proprietary medical devices, plus a full clinic management platform.
+A reverse-engineered integration layer for proprietary medical devices, plus a full-featured clinic management platform.
 
 Built by [PROFETIC](https://profetic.dev)
 
@@ -11,10 +11,13 @@ Built by [PROFETIC](https://profetic.dev)
 Legacy medical devices often ship with outdated, limited software. This project reverse-engineers proprietary serial protocols and builds a modern, extensible platform on top.
 
 ```
-Medical Devices → Protocol Bridge → Unified API → Clinic Platform
+Medical Devices → Protocol Bridge → REST API → React Clinic Platform
+     ↓                  ↓               ↓              ↓
+  3 device types    Auto-detect    Real-time     Full patient
+  reverse-engineered   & route      status       management
 ```
 
-**Result:** Devices that "couldn't talk to modern systems" now integrate seamlessly with custom workflows.
+**Result:** Devices that "couldn't talk to modern systems" now integrate with a modern web-based clinic platform.
 
 ---
 
@@ -22,17 +25,9 @@ Medical Devices → Protocol Bridge → Unified API → Clinic Platform
 
 ### 1. Protocol Reverse Engineering
 
-Analyzed undocumented serial communication to decode:
-- Command structures and opcodes
-- Timing requirements and handshakes
-- Response parsing and error states
-- Device-specific quirks and edge cases
-
-**Devices supported:** 3 PEMF therapy device types with automatic detection.
+Captured thousands of serial operations via USB sniffing, then built parsers to reconstruct the undocumented protocol.
 
 #### Sniffed Protocol Analysis
-
-Captured thousands of serial operations via USB sniffing, then built parsers to reconstruct the protocol:
 
 ```python
 def parse_protocol_file(filepath):
@@ -59,7 +54,7 @@ def parse_protocol_file(filepath):
             op_end = int(op_match.group(2)) if op_match.group(2) else op_start
             op_content = op_match.group(3)
             
-            # Extract timing data
+            # Extract timing data for protocol reconstruction
             delay_match = re.search(r'\[(\+)?(\d+)ms\]', op_content)
             delay_ms = int(delay_match.group(2)) if delay_match else 0
             
@@ -74,7 +69,7 @@ The USB sniffer occasionally drops fast back-to-back writes. We detect and fix t
 # Command context tracking for payload-aware fixes
 COMMAND_PAYLOADS = {
     'I': 54,    # Treatment name: exactly 54 chars
-    'R': 4,     # Run command: 4 char payload ("00hh")  
+    'R': 4,     # Run command: 4 char payload  
     'P': 4,     # Program command: 4 char payload
     'W': None,  # Write data: variable until 'V' terminator
     'i': None,  # Flash write: variable until DEL (0x7F)
@@ -83,129 +78,207 @@ COMMAND_PAYLOADS = {
 def fix_missing_bytes(operations):
     """
     Reconstruct dropped bytes using protocol context.
-    
-    When sniffer drops a WRITE, the subsequent READ echo won't match.
-    We detect mismatches and reconstruct the missing cycle.
+    Timing anomalies (31-32ms where 16ms expected) indicate missing cycles.
     """
-    # Track command state
     current_command = None
     payload_remaining = 0
     
     for i, op in enumerate(operations):
-        if op['action'] == 'WRITE':
-            byte_val = op.get('value', 0)
+        # Track command state to know expected payload lengths
+        if op['action'] == 'WRITE' and chr(op['value']) in COMMAND_PAYLOADS:
+            current_command = chr(op['value'])
             
-            # Check if inside a data payload first
-            if payload_remaining > 0:
-                payload_remaining -= 1
-                continue
-                
-            # Detect new command
-            if chr(byte_val) in COMMAND_PAYLOADS:
-                current_command = chr(byte_val)
-                # Payload starts after echo...
+        # Detect timing anomalies indicating dropped bytes
+        if op['action'] == 'READ' and op.get('delay_before_ms') in [31, 32]:
+            write_op = find_previous_write(operations, i)
+            if write_op and write_op.get('value') != op.get('value'):
+                # Echo mismatch — reconstruct missing cycle
+                insert_missing_cycle(fixed_ops, write_op, op)
 ```
 
-#### Timing-Based Anomaly Detection
+### 2. Unified Device Bridge
 
-Protocol timing reveals sniffer drops — a 31-32ms delay where 16ms is expected indicates a missing byte cycle:
+Auto-detects device type and routes to the appropriate protocol implementation:
 
 ```python
-# FIX: Mismatched echo with anomalous delay
-if (op['action'] == 'READ' and 
-        op.get('delay_before_ms') in [31, 32] and  # Double normal delay
-        i >= 2):
+def detect_device(handle):
+    """
+    Run Stage 1 init and detect device type from response signature.
+    Returns: ('MR72', serial) or ('EM272B', serial) or (None, None)
+    """
+    # Execute init sequence (identical for all devices)
+    for op in STAGE1_INIT_OPS:
+        execute_init_operation(handle, op)
     
-    # Find the WRITE this should be echoing
-    write_op = find_previous_write(operations, i)
+    # Device type indicated by response to Y command
+    # K = MR72/MagRez, H = EM272B, E = EM27, etc.
+    device_identifiers = {
+        ord('K'): 'MR72',
+        ord('H'): 'EM272B', 
+        ord('E'): 'EM27',
+        ord('G'): 'MR772',
+    }
     
-    if write_op and write_op.get('value') != op.get('value'):
-        # Echo doesn't match — sniffer dropped a full cycle
-        # Reconstruct: READ(correct) → PURGE → WRITE(dropped) → SET_TIMEOUTS → READ
-        insert_missing_cycle(fixed_ops, write_op, op)
+    for _ in range(15):
+        b = read_byte(handle)
+        if b in device_identifiers:
+            serial = read_serial_number(handle)
+            return device_identifiers[b], serial
+    
+    return None, None
 ```
 
-### 2. Device Abstraction Layer
+### 3. REST API Layer
 
-Unified interface regardless of underlying hardware:
+Flask API enabling web-based control:
 
 ```python
-# Same API across all device types
-class DeviceBridge:
-    def connect(self, port: str) -> bool
-    def get_status(self) -> DeviceStatus
-    def start_session(self, params: SessionConfig) -> Session
-    def stop_session(self) -> None
+@app.route('/api/send-to-device', methods=['POST'])
+def send_to_device():
+    """Store treatment on device (auto-detects device type)"""
     
-# Auto-detection handles device differences
-bridge = DeviceBridge.auto_detect()  # Returns correct implementation
+    # Auto-detect device
+    device_type, serial = detect_device(handle)
+    
+    # Route to appropriate protocol
+    if device_type == 'MR72':
+        operations = mr72_swap_treatment(MR72_PROTOCOL, name, reps, rows)
+    elif device_type == 'EM272B':
+        operations = em272b_swap_treatment(EM272B_PROTOCOL, treatment)
+    
+    # Execute protocol stages
+    execute_stage(handle, 1, operations)  # Init
+    execute_stage(handle, 2, operations)  # Store treatment
+    
+    return jsonify({
+        'success': True,
+        'device_type': device_type,
+        'serial_number': serial
+    })
+
+@app.route('/api/device/start', methods=['POST'])
+def start_device():
+    """Start treatment with optional resume from specific row"""
+    start_row = request.json.get('start_row', 0)
+    
+    # Threaded playback with real-time status updates
+    playback_thread = threading.Thread(
+        target=run_playback_thread, 
+        args=(False, start_row)
+    )
+    playback_thread.start()
 ```
 
-**Features:**
-- Automatic device type detection on connection
-- Plug-and-play switching between devices
-- Connection health monitoring and auto-reconnect
-- Graceful error handling
-
-### 3. Clinic Management Platform
+### 4. React Clinic Platform
 
 Full-featured web application for clinical operations:
 
-**Patient Management**
-- Patient records and history
-- Treatment plans and protocols
-- Session scheduling
+```jsx
+const TreatmentCompiler = ({ selectedFiles, onRemoveFile }) => {
+  const [deviceStatus, setDeviceStatus] = useState({
+    connected: false,
+    is_running: false,
+    is_loaded: false
+  });
+  
+  // Drag-and-drop treatment ordering
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor)
+  );
+  
+  // Real-time device status polling
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const res = await fetch('http://localhost:8000/api/device/status');
+      const status = await res.json();
+      setDeviceStatus(status);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+  
+  // Queue change detection — auto-unload when modified
+  useEffect(() => {
+    if (deviceStatus.is_loaded && queueChanged) {
+      fetch('http://localhost:8000/api/device/unload', { method: 'POST' });
+    }
+  }, [sortedFiles]);
+```
 
-**Session Tracking**
-- Real-time device monitoring
-- Session logging with parameters
-- Treatment history and notes
+**Platform Features:**
+- Treatment file browser and editor
+- Drag-and-drop treatment compilation
+- Patient record management
+- Session history and analytics
+- Multi-device support from single interface
+- Real-time playback status with pause/resume
 
-**Analytics Dashboard**
-- Usage statistics
-- Treatment outcomes tracking
-- Device utilization reports
+### 5. Analytics API
 
-### 4. System Architecture
+Backend service for clinic data management:
+
+```python
+@app.route('/api/patients', methods=['GET', 'POST'])
+def patients():
+    """Patient CRUD with treatment history"""
+    
+@app.route('/api/sessions', methods=['POST'])
+def record_session():
+    """Log treatment session with device data"""
+    
+@app.route('/api/analytics/frequency-usage')
+def frequency_analytics():
+    """Aggregate frequency usage across all sessions"""
+```
+
+---
+
+## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    React Frontend                            │
-│         (Patient UI / Session Control / Analytics)           │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      React Frontend (Vite)                          │
+│   File Browser │ Treatment Editor │ Compiler │ Patient Manager      │
+└─────────────────────────────────────────────────────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Flask REST API                          │
-│            (Auth / Patients / Sessions / Reports)            │
-└─────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-        ┌──────────┐   ┌──────────┐   ┌──────────────┐
-        │  MySQL   │   │  Bridge  │   │   Device     │
-        │ Database │   │  Layer   │   │  Hardware    │
-        └──────────┘   └──────────┘   └──────────────┘
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌──────────────────────────┐    ┌──────────────────────────┐
+│    Bridge Server (:8000) │    │   Analytics API (:5000)  │
+│    Flask + Windows API   │    │    Flask + MySQL         │
+│                          │    │                          │
+│  • Device auto-detect    │    │  • User authentication   │
+│  • Protocol execution    │    │  • Patient records       │
+│  • Playback control      │    │  • Session logging       │
+│  • Real-time status      │    │  • Usage analytics       │
+└──────────────────────────┘    └──────────────────────────┘
+              │                               │
+              ▼                               ▼
+┌──────────────────────────┐    ┌──────────────────────────┐
+│   Device Hardware        │    │      MySQL Database      │
+│   (MR72/EM272B/etc)      │    │   (resetmfg_analytics)   │
+└──────────────────────────┘    └──────────────────────────┘
 ```
 
 ---
 
 ## Tech Stack
 
-- **Bridge:** Python, PySerial
-- **API:** Flask, SQLAlchemy
-- **Frontend:** React
+- **Protocol Layer:** Python, ctypes (Windows API), PySerial
+- **Bridge Server:** Flask, threading
+- **Frontend:** React 18, Vite, Ant Design, dnd-kit
+- **Analytics API:** Flask, PyMySQL, SQLAlchemy
 - **Database:** MySQL
-- **Deployment:** Production-ready
 
 ---
 
 ## Results
 
-- **3** device types reverse-engineered and integrated
+- **3** proprietary device types reverse-engineered
 - **100%** replacement of limited vendor software
-- **Zero** dependency on original manufacturer
-- **Extensible** architecture for future device types
+- **Full clinic platform** — not just device control
+- **Pause/resume** playback with row-level precision
+- **Auto-detection** — plug in any supported device
 
 ---
 
